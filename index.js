@@ -7,7 +7,12 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+app.get('/', (req, res) => {
+  res.send('DeepAudit Backend is Live!');
+});
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
 
 function extractRepoInfo(url) {
   try {
