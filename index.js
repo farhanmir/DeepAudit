@@ -135,7 +135,7 @@ app.post('/api/audit', async (req, res) => {
       throw new Error('GEMINI_API_KEY is not configured in the environment.');
     }
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const result = await model.generateContent(prompt);
     const aiReport = result.response.text();
 
