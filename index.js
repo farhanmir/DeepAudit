@@ -151,6 +151,8 @@ app.post('/api/audit', async (req, res) => {
       created_at: baseData.created_at,
       updated_at: baseData.updated_at,
       open_issues: baseData.open_issues_count,
+      stars: baseData.stargazers_count,
+      forks: baseData.forks_count,
       commits_analyzed: commitsList.length,
       bad_commit_messages: badCommitCount,
       direct_pushes_to_branch: directPushes,
