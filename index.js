@@ -1,5 +1,4 @@
 const express = require('express');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -14,19 +13,14 @@ app.use((err, req, res, next) => {
 app.use(cors());
 
 app.get('/', (req, res) => {
-  res.send('DeepAudit Backend is Live! (Vercel Bridge Mode)');
+  res.send('DeepAudit Data Aggregator is Live! (Vercel Bridge Mode)');
 });
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
 
 function extractRepoInfo(url) {
   try {
-    // Basic regex or URL parsing
     const parsed = new URL(url);
     if (parsed.hostname !== 'github.com') return null;
     
-    // e.g. /owner/repo
     const parts = parsed.pathname.split('/').filter(Boolean);
     if (parts.length < 2) return null;
     
@@ -40,7 +34,6 @@ function extractRepoInfo(url) {
 }
 
 app.post('/api/audit', async (req, res) => {
-  // Vercel sometimes pre-parses the body. If not, Express might need it.
   const body = req.body || {};
   const { repoUrl } = body;
   
@@ -50,7 +43,6 @@ app.post('/api/audit', async (req, res) => {
       receivedBody: body 
     });
   }
-
 
   const repoInfo = extractRepoInfo(repoUrl);
   if (!repoInfo) {
@@ -65,29 +57,26 @@ app.post('/api/audit', async (req, res) => {
       'User-Agent': 'DeepAudit-App'
     };
 
-    // If you add GITHUB_TOKEN to .env, uncomment this to avoid aggressive rate limits
     if (process.env.GITHUB_TOKEN) {
       headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
     }
 
     const endpoints = [
       `https://api.github.com/repos/${owner}/${repo}`,
-      `https://api.github.com/repos/${owner}/${repo}/languages`,
-      `https://api.github.com/repos/${owner}/${repo}/commits?per_page=30`
+      `https://api.github.com/repos/${owner}/${repo}/commits?per_page=50`,
+      `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=20`
     ];
 
-    // Fetch all endpoints concurrently
-    const [baseRes, langsRes, commitsRes] = await Promise.all(
+    const [baseRes, commitsRes, pullsRes] = await Promise.all(
       endpoints.map(url => fetch(url, { headers }))
     );
 
-    // Identify failures gracefully
-    if (!baseRes.ok || !langsRes.ok || !commitsRes.ok) {
+    if (!baseRes.ok || !commitsRes.ok || !pullsRes.ok) {
       const status = baseRes.status !== 200 ? baseRes.status : 
-                     (langsRes.status !== 200 ? langsRes.status : commitsRes.status);
+                     (commitsRes.status !== 200 ? commitsRes.status : pullsRes.status);
       
       const failingRes = baseRes.status !== 200 ? baseRes : 
-                         (langsRes.status !== 200 ? langsRes : commitsRes);
+                         (commitsRes.status !== 200 ? commitsRes : pullsRes);
       
       const errorData = await failingRes.json().catch(() => ({}));
       
@@ -102,53 +91,80 @@ app.post('/api/audit', async (req, res) => {
       });
     }
 
-
-    // Parse raw JSON
     const baseData = await baseRes.json();
-    const langsData = await langsRes.json();
     const commitsDataBody = await commitsRes.json();
+    const pullsDataBody = await pullsRes.json();
 
     const commitsList = Array.isArray(commitsDataBody) ? commitsDataBody : [];
+    const pullsList = Array.isArray(pullsDataBody) ? pullsDataBody : [];
 
-    // Compile single clean summary object
-    const githubStats = {
-      name: baseData.name,
-      owner: baseData.owner.login,
-      description: baseData.description,
-      stars: baseData.stargazers_count,
-      forks: baseData.forks_count,
+    // --- Process Commits ---
+    const badPatterns = /\b(fix|wip|update|fuck|shit|damn|crap|test)\b/i;
+    let badCommitCount = 0;
+    let directPushes = 0;
+    const worstCommits = [];
+
+    // Check if pushed directly to default branch by seeing if any commit came from PR?
+    // We strictly look for "bad" patterns to fulfill the 'bad commit messages' requirement
+    commitsList.forEach(c => {
+      const msg = c.commit.message || "";
+      const firstLine = msg.split('\n')[0];
+      
+      // Heuristic for direct pushes to default branch: 1 parent and not a standard PR merge pattern
+      if (c.parents && c.parents.length === 1 && !msg.toLowerCase().includes("merge pull request") && !msg.includes("(#")) {
+        directPushes++;
+      }
+
+      if (badPatterns.test(firstLine) || msg.length < 5) {
+        badCommitCount++;
+        if (worstCommits.length < 5) {
+          worstCommits.push({
+            hash: c.sha.substring(0, 7),
+            message: firstLine,
+            author: c.commit.author?.name
+          });
+        }
+      }
+    });
+
+    // --- Process Pull Requests ---
+    let stalePrcount = 0;
+    let oldestPrAgeDays = 0;
+    const now = new Date();
+
+    pullsList.forEach(pr => {
+      const prDate = new Date(pr.created_at);
+      const diffTime = Math.abs(now - prDate);
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      
+      if (diffDays > 14) {
+        stalePrcount++;
+      }
+      if (diffDays > oldestPrAgeDays) {
+        oldestPrAgeDays = diffDays;
+      }
+    });
+
+    // Compile highly condensed roastMetrics object
+    const roastMetrics = {
+      repository: `${baseData.owner.login}/${baseData.name}`,
+      created_at: baseData.created_at,
+      updated_at: baseData.updated_at,
       open_issues: baseData.open_issues_count,
-      languages: langsData,
-      recent_commits: commitsList.map(c => ({
-        message: c.commit.message,
-        date: c.commit.author?.date,
-        author: c.commit.author?.name
-      }))
+      commits_analyzed: commitsList.length,
+      bad_commit_messages: badCommitCount,
+      direct_pushes_to_branch: directPushes,
+      worst_commits: worstCommits,
+      stale_prs: stalePrcount,
+      oldest_pr_age_days: oldestPrAgeDays
     };
 
-    // Prompt Gemini
-    const systemInstruction = `You are a ruthless, elite Principal Engineer doing an architectural review. Analyze the provided GitHub repo data. Be brutally honest, highly technical, and direct. Roast their commit message quality, evaluate their language sprawl, and assess their technical debt based on the open-issues-to-stars ratio. Format your response in clean Markdown.`;
-    
-    const prompt = `${systemInstruction}\n\nHere is the GitHub repository data to analyze:\n${JSON.stringify(githubStats, null, 2)}`;
-
-    if (!process.env.GEMINI_API_KEY) {
-      throw new Error('GEMINI_API_KEY is not configured in the environment.');
-    }
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent(prompt);
-    const aiReport = result.response.text();
-
-    // Output payload
-    return res.status(200).json({
-      githubStats,
-      aiReport
-    });
+    return res.status(200).json({ roastMetrics });
 
   } catch (error) {
     console.error('[Audit Error]', error);
     return res.status(500).json({ 
-      error: 'An unexpected error occurred during the audit.', 
+      error: 'An unexpected error occurred during the audit calculation.', 
       details: error.message 
     });
   }
@@ -162,4 +178,3 @@ if (require.main === module) {
 }
 
 module.exports = app;
-
