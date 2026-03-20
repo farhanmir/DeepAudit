@@ -8,7 +8,7 @@ app.use(express.json());
 app.use(cors());
 
 app.get('/', (req, res) => {
-  res.send('DeepAudit Backend is Live! (via /api)');
+  res.send('DeepAudit Backend is Live! (Vercel Bridge Mode)');
 });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -33,7 +33,7 @@ function extractRepoInfo(url) {
   }
 }
 
-app.post('/audit', async (req, res) => {
+app.post('/api/audit', async (req, res) => {
   const { repoUrl } = req.body;
   
   if (!repoUrl) {
