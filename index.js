@@ -34,11 +34,17 @@ function extractRepoInfo(url) {
 }
 
 app.post('/api/audit', async (req, res) => {
-  const { repoUrl } = req.body;
+  // Vercel sometimes pre-parses the body. If not, Express might need it.
+  const body = req.body || {};
+  const { repoUrl } = body;
   
   if (!repoUrl) {
-    return res.status(400).json({ error: 'repoUrl is required in the JSON body.' });
+    return res.status(400).json({ 
+      error: 'repoUrl is required in the JSON body.',
+      receivedBody: body 
+    });
   }
+
 
   const repoInfo = extractRepoInfo(repoUrl);
   if (!repoInfo) {
