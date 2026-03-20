@@ -71,19 +71,25 @@ app.post('/api/audit', async (req, res) => {
 
     // Identify failures gracefully
     if (!baseRes.ok || !langsRes.ok || !commitsRes.ok) {
-      // Find the failing status
       const status = baseRes.status !== 200 ? baseRes.status : 
                      (langsRes.status !== 200 ? langsRes.status : commitsRes.status);
       
+      const failingRes = baseRes.status !== 200 ? baseRes : 
+                         (langsRes.status !== 200 ? langsRes : commitsRes);
+      
+      const errorData = await failingRes.json().catch(() => ({}));
+      
       let message = 'Failed to fetch repository data from GitHub.';
       if (status === 404) message = 'Repository not found or is private.';
-      if (status === 403 || status === 429) message = 'GitHub API rate limit exceeded.';
+      if (status === 403 || status === 429) message = 'GitHub API rate limit exceeded. You likely need a GITHUB_TOKEN on Vercel.';
       
       return res.status(status >= 500 ? 500 : 400).json({ 
         error: message, 
-        details: `GitHub API returned status ${status}` 
+        githubStatus: status,
+        githubError: errorData
       });
     }
+
 
     // Parse raw JSON
     const baseData = await baseRes.json();
