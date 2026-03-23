@@ -1,29 +1,19 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config();
 
 const app = express();
-app.use(express.json());
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
-    return res.status(400).json({ error: 'Malformed JSON payload. Check your quotes.' });
-  }
-  next();
-});
 app.use(cors());
+app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.send('DeepAudit Data Aggregator is Live! (Vercel Bridge Mode)');
-});
+const PORT = process.env.PORT || 3001;
 
 function extractRepoInfo(url) {
   try {
     const parsed = new URL(url);
     if (parsed.hostname !== 'github.com') return null;
-    
     const parts = parsed.pathname.split('/').filter(Boolean);
     if (parts.length < 2) return null;
-    
     return {
       owner: parts[0],
       repo: parts[1].replace(/\.git$/, '')
@@ -34,149 +24,127 @@ function extractRepoInfo(url) {
 }
 
 app.post('/api/audit', async (req, res) => {
-  const body = req.body || {};
-  const { repoUrl } = body;
-  
-  if (!repoUrl) {
-    return res.status(400).json({ 
-      error: 'repoUrl is required in the JSON body.',
-      receivedBody: body 
-    });
-  }
-
-  const repoInfo = extractRepoInfo(repoUrl);
-  if (!repoInfo) {
-    return res.status(400).json({ error: 'Invalid GitHub repository URL provided.' });
-  }
-
-  const { owner, repo } = repoInfo;
-
   try {
+    const { repoUrl, githubToken } = req.body || {};
+    if (!repoUrl) {
+      return res.status(400).json({ error: 'repoUrl is required' });
+    }
+
+    const repoInfo = extractRepoInfo(repoUrl);
+    if (!repoInfo) {
+      return res.status(400).json({ error: 'Invalid GitHub repository URL' });
+    }
+    const { owner, repo } = repoInfo;
+
     const headers = {
       'Accept': 'application/vnd.github.v3+json',
       'User-Agent': 'DeepAudit-App'
     };
 
-    if (process.env.GITHUB_TOKEN) {
-      headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
+    const token = githubToken || process.env.GITHUB_TOKEN;
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
+    const baseUrl = `https://api.github.com/repos/${owner}/${repo}`;
     const endpoints = [
-      `https://api.github.com/repos/${owner}/${repo}`,
-      `https://api.github.com/repos/${owner}/${repo}/commits?per_page=50`,
-      `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=20`
+      baseUrl,
+      `${baseUrl}/commits?per_page=30`,
+      `${baseUrl}/pulls?state=open&per_page=50`,
+      `${baseUrl}/languages`
     ];
 
-    const [baseRes, commitsRes, pullsRes] = await Promise.all(
+    const responses = await Promise.all(
       endpoints.map(url => fetch(url, { headers }))
     );
 
-    if (!baseRes.ok || !commitsRes.ok || !pullsRes.ok) {
-      const status = baseRes.status !== 200 ? baseRes.status : 
-                     (commitsRes.status !== 200 ? commitsRes.status : pullsRes.status);
-      
-      const failingRes = baseRes.status !== 200 ? baseRes : 
-                         (commitsRes.status !== 200 ? commitsRes : pullsRes);
-      
-      const errorData = await failingRes.json().catch(() => ({}));
-      
-      let message = 'Failed to fetch repository data from GitHub.';
-      if (status === 404) message = 'Repository not found or is private.';
-      if (status === 403 || status === 429) message = 'GitHub API rate limit exceeded. You likely need a GITHUB_TOKEN on Vercel.';
-      
-      return res.status(status >= 500 ? 500 : 400).json({ 
-        error: message, 
-        githubStatus: status,
-        githubError: errorData
-      });
+    for (const r of responses) {
+      if (!r.ok) {
+        if (r.status === 401) {
+          return res.status(401).json({ error: 'Unauthorized — private repo or bad token' });
+        }
+        if (r.status === 404) {
+          return res.status(404).json({ error: 'Repository not found' });
+        }
+        if (r.status === 403) {
+          return res.status(403).json({ error: 'GitHub rate limit exceeded' });
+        }
+        return res.status(r.status).json({ error: `GitHub API error: ${r.statusText}` });
+      }
     }
 
-    const baseData = await baseRes.json();
-    const commitsDataBody = await commitsRes.json();
-    const pullsDataBody = await pullsRes.json();
+    const [repoData, commitsData, pullsData, languagesData] = await Promise.all(
+      responses.map(r => r.json())
+    );
 
-    const commitsList = Array.isArray(commitsDataBody) ? commitsDataBody : [];
-    const pullsList = Array.isArray(pullsDataBody) ? pullsDataBody : [];
+    let bad_commit_messages = 0;
+    let direct_pushes_to_main = 0;
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const badCommitRegex = /^(fix|wip|update|test|oops|misc|\.{1,3}|changes|temp)$/i;
 
-    // --- Process Commits ---
-    const badPatterns = /\b(fix|wip|update|fuck|shit|damn|crap|test)\b/i;
-    let badCommitCount = 0;
-    let directPushes = 0;
-    const worstCommits = [];
+    const recent_commits = [];
 
-    // Check if pushed directly to default branch by seeing if any commit came from PR?
-    // We strictly look for "bad" patterns to fulfill the 'bad commit messages' requirement
-    commitsList.forEach(c => {
-      const msg = c.commit.message || "";
-      const firstLine = msg.split('\n')[0];
-      
-      // Heuristic for direct pushes to default branch: 1 parent and not a standard PR merge pattern
-      if (c.parents && c.parents.length === 1 && !msg.toLowerCase().includes("merge pull request") && !msg.includes("(#")) {
-        directPushes++;
+    if (Array.isArray(commitsData)) {
+      for (const commitObj of commitsData) {
+        const msg = commitObj.commit?.message || '';
+        const trimmedMsg = msg.trim();
+        
+        if (trimmedMsg.length <= 8 || badCommitRegex.test(trimmedMsg)) {
+          bad_commit_messages++;
+        }
+
+        const commitDateStr = commitObj.commit?.author?.date;
+        if (commitDateStr) {
+          const commitDate = new Date(commitDateStr);
+          if (commitObj.parents && commitObj.parents.length === 1 && commitDate >= ninetyDaysAgo) {
+            direct_pushes_to_main++;
+          }
+        }
+
+        recent_commits.push({
+          message: msg,
+          date: commitDateStr || '',
+          author: commitObj.author?.login || commitObj.commit?.author?.name || ''
+        });
       }
+    }
 
-      if (badPatterns.test(firstLine) || msg.length < 5) {
-        badCommitCount++;
-        if (worstCommits.length < 5) {
-          worstCommits.push({
-            hash: c.sha.substring(0, 7),
-            message: firstLine,
-            author: c.commit.author?.name
-          });
+    let stale_prs = 0;
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    if (Array.isArray(pullsData)) {
+      for (const pr of pullsData) {
+        const createdAt = new Date(pr.created_at);
+        if (createdAt < thirtyDaysAgo) {
+          stale_prs++;
         }
       }
-    });
+    }
 
-    // --- Process Pull Requests ---
-    let stalePrcount = 0;
-    let oldestPrAgeDays = 0;
-    const now = new Date();
-
-    pullsList.forEach(pr => {
-      const prDate = new Date(pr.created_at);
-      const diffTime = Math.abs(now - prDate);
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-      
-      if (diffDays > 14) {
-        stalePrcount++;
-      }
-      if (diffDays > oldestPrAgeDays) {
-        oldestPrAgeDays = diffDays;
-      }
-    });
-
-    // Compile highly condensed roastMetrics object
     const roastMetrics = {
-      repository: `${baseData.owner.login}/${baseData.name}`,
-      created_at: baseData.created_at,
-      updated_at: baseData.updated_at,
-      open_issues: baseData.open_issues_count,
-      stars: baseData.stargazers_count,
-      forks: baseData.forks_count,
-      commits_analyzed: commitsList.length,
-      bad_commit_messages: badCommitCount,
-      direct_pushes_to_branch: directPushes,
-      worst_commits: worstCommits,
-      stale_prs: stalePrcount,
-      oldest_pr_age_days: oldestPrAgeDays
+      repository: `${owner}/${repo}`,
+      description: repoData.description || null,
+      stars: repoData.stargazers_count,
+      forks: repoData.forks_count,
+      open_issues: repoData.open_issues_count,
+      created_at: repoData.created_at,
+      updated_at: repoData.updated_at,
+      commits_analyzed: Array.isArray(commitsData) ? commitsData.length : 0,
+      bad_commit_messages,
+      direct_pushes_to_main,
+      stale_prs,
+      languages: languagesData || {},
+      recent_commits
     };
 
-    return res.status(200).json({ roastMetrics });
+    res.json({ roastMetrics });
 
   } catch (error) {
-    console.error('[Audit Error]', error);
-    return res.status(500).json({ 
-      error: 'An unexpected error occurred during the audit calculation.', 
-      details: error.message 
-    });
+    console.error('Audit error:', error);
+    res.status(500).json({ error: error.message || 'Internal Server Error' });
   }
 });
 
-if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`DeepAudit server running on port ${PORT}`);
-  });
-}
-
-module.exports = app;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
